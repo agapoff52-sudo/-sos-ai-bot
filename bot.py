@@ -1,6 +1,10 @@
 import asyncio
 import logging
 import os
+from telegram import Update
+from telegram.ext import ContextTypes
+
+user_memory = {}
 from collections import defaultdict, deque
 from typing import Deque, Dict, List
 
@@ -302,28 +306,53 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # MAIN MESSAGE HANDLER
 # ----------------------------
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
-
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_text = update.message.text.strip()
+    user_text = update.message.text
 
-    if not user_text:
-        return
+    # --- Инициализация памяти ---
+    if user_id not in user_memory:
+        user_memory[user_id] = []
 
-    save_to_history(user_id, "user", user_text)
+    # --- Сохраняем сообщение пользователя ---
+    user_memory[user_id].append({
+        "role": "user",
+        "content": user_text
+    })
 
-    await context.bot.send_chat_action(
-        chat_id=update.effective_chat.id,
-        action=ChatAction.TYPING,
-    )
+    # --- Ограничиваем память (последние 10 сообщений) ---
+    user_memory[user_id] = user_memory[user_id][-10:]
 
-    reply = await generate_ai_reply(user_id, user_text)
-    save_to_history(user_id, "assistant", reply)
+    try:
+        # --- Формируем сообщения для OpenAI ---
+        messages = [
+            {
+                "role": "system",
+                "content": BASE_INSTRUCTIONS + "\n\n" + STYLE_RULES
+            }
+        ] + user_memory[user_id]
 
-    for chunk in split_long_message(reply):
-        await update.message.reply_text(chunk)
+        # --- Запрос к OpenAI ---
+        response = client.responses.create(
+            model="gpt-5.4-mini",
+            input=messages
+        )
+
+        # --- Получаем ответ ---
+        bot_reply = response.output_text
+
+        # --- Сохраняем ответ бота ---
+        user_memory[user_id].append({
+            "role": "assistant",
+            "content": bot_reply
+        })
+
+        # --- Отправляем ответ пользователю ---
+        await update.message.reply_text(bot_reply)
+
+    except Exception as e:
+        print("Ошибка OpenAI:", e)
+        await update.message.reply_text("Сейчас что-то не получилось. Попробуй ещё раз.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
