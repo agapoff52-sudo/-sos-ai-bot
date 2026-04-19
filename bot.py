@@ -113,10 +113,18 @@ STYLE_RULES = """
 — если слышишь противоречие, аккуратно называй его
 — если человек говорит общо, помогай сузить фокус
 — если человек звучит отстранённо, возвращай его к живому переживанию
+— если человек задаёт короткий вопрос (например: "почему", "и что", "зачем"), 
+  интерпретируй его строго в контексте предыдущего сообщения, 
+  не расширяй тему и не уходи в обобщения
+— не усложняй, если человек говорит просто
+— отвечай ближе к живому разговору, а не как эксперт
+— если видишь очевидный смысл, говори его прямо, без размазывания
 — не бойся формулировок вроде:
   "вопрос, возможно, не в этом"
   "похоже, ты сейчас..."
   "как будто внутри есть две части"
+— отвечай как внимательный человек, который умеет видеть глубже слов
+— если видишь очевидный смысл, говори его прямо, но без грубости
 — ответ должен ощущаться как личный разговор, а не как универсальная поддержка
 """
 
@@ -147,6 +155,24 @@ STATE_MODE_INSTRUCTIONS = """
 Не перегружай. Будь точным.
 """
 
+MIRROR_MODE_INSTRUCTIONS = """
+Ты работаешь в режиме /mirror.
+
+Твоя задача — быть честным зеркалом.
+Не утешать автоматически и не сглаживать.
+
+Что делать:
+1. Коротко назвать, что ты видишь
+2. Указать на возможное внутреннее противоречие
+3. Задать один точный вопрос, от которого сложно уйти
+
+Тон:
+— прямой
+— тёплый
+— честный
+— без грубости
+"""
+
 HELP_TEXT = """
 Доступные команды:
 
@@ -154,6 +180,7 @@ HELP_TEXT = """
 /help — список команд
 /emotion — режим разбора эмоции
 /state — режим анализа состояния
+/mirror — режим честного зеркала
 /reset — очистить память диалога
 
 Обычный режим:
@@ -170,6 +197,8 @@ def get_mode_instructions(mode: str) -> str:
         return BASE_INSTRUCTIONS + "\n\n" + STYLE_RULES + "\n\n" + EMOTION_MODE_INSTRUCTIONS
     if mode == "state":
         return BASE_INSTRUCTIONS + "\n\n" + STYLE_RULES + "\n\n" + STATE_MODE_INSTRUCTIONS
+    if mode == "mirror":
+        return BASE_INSTRUCTIONS + "\n\n" + STYLE_RULES + "\n\n" + MIRROR_MODE_INSTRUCTIONS
     return BASE_INSTRUCTIONS + "\n\n" + STYLE_RULES
 
 
@@ -292,6 +321,15 @@ async def state_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def mirror_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    user_modes[user_id] = "mirror"
+    await update.message.reply_text(
+        "Режим /mirror включён.\n\n"
+        "Можешь написать мысль, состояние или ситуацию, а я отвечу как честное зеркало — прямее и глубже."
+    )
+
+
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     user_histories[user_id].clear()
@@ -308,23 +346,22 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_text = update.message.text
+    user_text = update.message.text.strip()
 
-    # --- Инициализация памяти ---
+    if not user_text:
+        return
+
     if user_id not in user_memory:
         user_memory[user_id] = []
 
-    # --- Сохраняем сообщение пользователя ---
     user_memory[user_id].append({
         "role": "user",
         "content": user_text
     })
 
-    # --- Ограничиваем память (последние 10 сообщений) ---
-    user_memory[user_id] = user_memory[user_id][-10:]
+    user_memory[user_id] = user_memory[user_id][-20:]
 
     try:
-        # --- Формируем сообщения для OpenAI ---
         messages = [
             {
                 "role": "system",
@@ -332,22 +369,23 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         ] + user_memory[user_id]
 
-        # --- Запрос к OpenAI ---
         response = client.responses.create(
             model="gpt-5.4-mini",
             input=messages
         )
 
-        # --- Получаем ответ ---
-        bot_reply = response.output_text
+        bot_reply = (response.output_text or "").strip()
 
-        # --- Сохраняем ответ бота ---
+        if not bot_reply:
+            bot_reply = "Сейчас у меня не получилось нормально сформулировать ответ. Попробуй сказать это чуть подробнее."
+
         user_memory[user_id].append({
             "role": "assistant",
             "content": bot_reply
         })
 
-        # --- Отправляем ответ пользователю ---
+        user_memory[user_id] = user_memory[user_id][-20:]
+
         await update.message.reply_text(bot_reply)
 
     except Exception as e:
@@ -370,6 +408,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("emotion", emotion_command))
     app.add_handler(CommandHandler("state", state_command))
+    app.add_handler(CommandHandler("mirror", mirror_command))
     app.add_handler(CommandHandler("reset", reset_command))
 
     app.add_handler(
