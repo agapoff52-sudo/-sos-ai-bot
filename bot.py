@@ -1,10 +1,21 @@
 import asyncio
 import logging
 import os
+import json
+from datetime import datetime
+from telegram import Update
 from telegram import Update
 from telegram.ext import ContextTypes
 
 user_memory = {}
+user_profiles = {}
+analytics = {
+    "total_messages": 0,
+    "total_users": 0
+}
+
+DATA_FILE = "bot_data.json"
+ADMIN_ID = 221532110  # сюда вставишь свой Telegram user_id
 from collections import defaultdict, deque
 from typing import Deque, Dict, List
 
@@ -80,9 +91,14 @@ BASE_INSTRUCTIONS = """
 — скрытую боль под усталостью, раздражением, тревогой или пустотой
 
 Как ты строишь ответ:
-1. Коротко отражаешь, что услышал
-2. Добавляешь одно точное наблюдение глубже
-3. Задаёшь один сильный, живой вопрос
+— структура НЕ фиксированная
+— иногда это 1 короткое предложение
+— иногда 2–3 абзаца
+— иногда только вопрос
+— ориентируйся на состояние человека, а не на шаблон
+
+Важно:
+— не делай ответы одинаковой длины
 
 Тон:
 — как умный и внимательный друг
@@ -101,6 +117,30 @@ BASE_INSTRUCTIONS = """
 — не говорить сверху вниз
 — не быть слишком правильным и стерильным
 — лучше один точный вопрос, чем много хороших слов
+— не уходи от разговора фразами вроде "если хочешь можем не говорить"
+— если человек пришёл с состоянием, помогай его прояснить, а не избегать
+— мягкость не должна превращаться в уклонение
+— если смысл неочевиден, предложи 2 возможные интерпретации состояния
+— делай это коротко и точно
+— не превращай это в длинный список
+— если человек задаёт короткий вопрос ("почему", "и что", "зачем"),
+  обязательно связывай ответ с предыдущим сообщением
+— не начинай новый смысл с нуля
+
+Если человек говорит о суициде, желании исчезнуть или сильной безысходности:
+
+— не игнорируй это
+— не обесценивай
+— не давай жёстких инструкций
+— сначала отрази состояние человека
+— мягко уточни уровень опасности ("ты сейчас просто говоришь или есть мысли навредить себе?")
+— предложи обратиться к живому человеку (друг, близкий, специалист)
+
+Тон:
+— спокойный
+— бережный
+— без паники
+— без давления
 
 Главная идея:
 ты не спасаешь человека и не чинишь его.
@@ -126,6 +166,13 @@ STYLE_RULES = """
 — отвечай как внимательный человек, который умеет видеть глубже слов
 — если видишь очевидный смысл, говори его прямо, но без грубости
 — ответ должен ощущаться как личный разговор, а не как универсальная поддержка
+— не повторяй одинаковые структуры ответов
+— избегай одинаковых формулировок в начале ответа
+— чередуй стиль: иногда через наблюдение, иногда через вопрос, иногда через прямую мысль
+— не используй одни и те же слова и конструкции несколько сообщений подряд
+— не используй одинаковые вводные фразы ("похоже", "как будто", "слышу") подряд
+— заменяй их синонимами или убирай полностью
+— допускается иногда говорить прямо, без вводных конструкций
 """
 
 EMOTION_MODE_INSTRUCTIONS = """
@@ -200,6 +247,89 @@ def get_mode_instructions(mode: str) -> str:
     if mode == "mirror":
         return BASE_INSTRUCTIONS + "\n\n" + STYLE_RULES + "\n\n" + MIRROR_MODE_INSTRUCTIONS
     return BASE_INSTRUCTIONS + "\n\n" + STYLE_RULES
+
+
+def load_data():
+    global user_memory, user_profiles, analytics
+
+    if not os.path.exists(DATA_FILE):
+        return
+
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        user_memory = {int(k): v for k, v in data.get("user_memory", {}).items()}
+        user_profiles = {int(k): v for k, v in data.get("user_profiles", {}).items()}
+        analytics = data.get("analytics", {
+            "total_messages": 0,
+            "total_users": 0
+        })
+    except Exception as e:
+        print("Ошибка загрузки данных:", e)
+
+
+def save_data():
+    try:
+        data = {
+            "user_memory": user_memory,
+            "user_profiles": user_profiles,
+            "analytics": analytics
+        }
+
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Ошибка сохранения данных:", e)
+
+def update_user_profile(user_id: int, user_text: str):
+    if user_id not in user_profiles:
+        user_profiles[user_id] = {
+            "summary": "",
+            "themes": [],
+            "last_seen": "",
+            "message_count": 0,
+            "username": "",
+            "first_name": ""
+        }
+
+    profile = user_profiles[user_id]
+
+    profile["last_seen"] = datetime.utcnow().isoformat()
+    profile["message_count"] += 1
+
+    text_lower = user_text.lower()
+
+    possible_themes = {
+        "усталость": ["устал", "вымотан", "нет сил"],
+        "тревога": ["тревога", "тревожно", "страшно"],
+        "одиночество": ["одиноко", "одиночество", "никто"],
+        "пустота": ["пусто", "пустота", "ничего не чувствую"],
+        "отношения": ["отношения", "партнёр", "любовь", "расставание"],
+        "смысл": ["смысл", "зачем", "для чего"],
+        "самооценка": ["недостаточно", "неуверенность", "не ценят"]
+    }
+
+    found_themes = []
+
+    for theme, keywords in possible_themes.items():
+        for keyword in keywords:
+            if keyword in text_lower:
+                found_themes.append(theme)
+                break
+
+    current_themes = set(profile.get("themes", []))
+    current_themes.update(found_themes)
+    profile["themes"] = list(current_themes)[:10]
+
+    if not profile["summary"]:
+        profile["summary"] = f"Пользователь часто пишет о темах: {', '.join(profile['themes'])}" if profile["themes"] else "Профиль пока пуст."
+    else:
+        if profile["themes"]:
+            profile["summary"] = f"Повторяющиеся темы: {', '.join(profile['themes'])}"
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 
 def build_input_items(history, user_text):
@@ -339,6 +469,115 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "Режим снова обычный."
     )
 
+async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    text = (
+        f"Статистика бота:\n\n"
+        f"Всего пользователей: {len(user_profiles)}\n"
+        f"Всего сообщений: {analytics.get('total_messages', 0)}\n"
+        f"Активных диалогов в памяти: {len(user_memory)}"
+    )
+    await update.message.reply_text(text)
+
+
+async def admin_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    if not user_profiles:
+        await update.message.reply_text("Пользователей пока нет.")
+        return
+
+    lines = []
+
+    for uid, profile in user_profiles.items():
+        line = (
+            f"ID: {uid}\n"
+            f"Имя: {profile.get('first_name', '')}\n"
+            f"Username: @{profile.get('username', '')}\n"
+            f"Сообщений: {profile.get('message_count', 0)}\n"
+            f"Темы: {', '.join(profile.get('themes', []))}\n"
+        )
+        lines.append(line)
+
+    text = "\n---\n".join(lines)
+    await update.message.reply_text(text[:4000])
+
+
+async def admin_history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Используй: /admin_history user_id")
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+
+    if target_user_id not in user_memory or not user_memory[target_user_id]:
+        await update.message.reply_text("История для этого пользователя не найдена.")
+        return
+
+    lines = []
+
+    for msg in user_memory[target_user_id]:
+        role = "Пользователь" if msg["role"] == "user" else "Бот"
+        lines.append(f"{role}: {msg['content']}")
+
+    text = "\n\n".join(lines)
+    await update.message.reply_text(text[:4000])
+
+
+async def admin_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("Нет доступа.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Используй: /admin_profile user_id")
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("user_id должен быть числом.")
+        return
+
+    profile = user_profiles.get(target_user_id)
+
+    if not profile:
+        await update.message.reply_text("Профиль не найден.")
+        return
+
+    text = (
+        f"Профиль пользователя {target_user_id}:\n\n"
+        f"Имя: {profile.get('first_name', '')}\n"
+        f"Username: @{profile.get('username', '')}\n"
+        f"Сообщений: {profile.get('message_count', 0)}\n"
+        f"Последняя активность: {profile.get('last_seen', '')}\n"
+        f"Темы: {', '.join(profile.get('themes', []))}\n"
+        f"Summary: {profile.get('summary', '')}"
+    )
+
+    await update.message.reply_text(text[:4000])
+
 
 # ----------------------------
 # MAIN MESSAGE HANDLER
@@ -346,6 +585,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    user = update.effective_user
     user_text = update.message.text.strip()
 
     if not user_text:
@@ -354,12 +594,31 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in user_memory:
         user_memory[user_id] = []
 
+    if user_id not in user_profiles:
+        user_profiles[user_id] = {
+            "summary": "",
+            "themes": [],
+            "last_seen": "",
+            "message_count": 0,
+            "username": user.username or "",
+            "first_name": user.first_name or ""
+        }
+
+    user_profiles[user_id]["username"] = user.username or ""
+    user_profiles[user_id]["first_name"] = user.first_name or ""
+
     user_memory[user_id].append({
         "role": "user",
         "content": user_text
     })
 
     user_memory[user_id] = user_memory[user_id][-20:]
+
+    analytics["total_messages"] = analytics.get("total_messages", 0) + 1
+    analytics["total_users"] = len(user_profiles)
+
+    update_user_profile(user_id, user_text)
+    save_data()
 
     try:
         messages = [
@@ -385,6 +644,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         })
 
         user_memory[user_id] = user_memory[user_id][-20:]
+        save_data()
 
         await update.message.reply_text(bot_reply)
 
@@ -402,6 +662,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ----------------------------
 
 def main() -> None:
+    load_data()
+
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
@@ -410,6 +673,12 @@ def main() -> None:
     app.add_handler(CommandHandler("state", state_command))
     app.add_handler(CommandHandler("mirror", mirror_command))
     app.add_handler(CommandHandler("reset", reset_command))
+
+
+    app.add_handler(CommandHandler("admin_stats", admin_stats_command))
+    app.add_handler(CommandHandler("admin_users", admin_users_command))
+    app.add_handler(CommandHandler("admin_history", admin_history_command))
+    app.add_handler(CommandHandler("admin_profile", admin_profile_command))
 
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
